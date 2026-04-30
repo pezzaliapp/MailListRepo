@@ -453,17 +453,12 @@ function showError(msg) {
   box.textContent = msg;
 }
 
-function updateProcessButton() {
-  $("btnProcess").disabled = !(state.anagrafica && state.ordini && state.vendite);
-}
-
 function bindFile(inputId, statusId, key, label) {
   $(inputId).addEventListener("change", async (ev) => {
     const f = ev.target.files[0];
     if (!f) {
       state[key] = null;
       setStatus(statusId, "", true);
-      updateProcessButton();
       return;
     }
     setStatus(statusId, "Lettura in corso…", true);
@@ -475,7 +470,6 @@ function bindFile(inputId, statusId, key, label) {
       state[key] = null;
       setStatus(statusId, `Errore: ${err.message || err}`, false);
     }
-    updateProcessButton();
   });
 }
 
@@ -488,11 +482,19 @@ function reset() {
   ["statusAnagrafica", "statusOrdini", "statusVendite"].forEach((id) => setStatus(id, "", true));
   ["cardVendite", "cardOrdini", "cardMaillist"].forEach((id) => ($(id).style.display = "none"));
   showError("");
-  updateProcessButton();
 }
 
 function process() {
+  console.log("Elabora cliccato");
   showError("");
+  const missing = [];
+  if (!state.anagrafica) missing.push("Anagrafica");
+  if (!state.ordini) missing.push("Ordini");
+  if (!state.vendite) missing.push("Vendite");
+  if (missing.length) {
+    showError("Carica tutti e 3 i file prima di elaborare. Mancano: " + missing.join(", "));
+    return;
+  }
   try {
     const anagrafica = parseAnagrafica(state.anagrafica);
     const vendite = parseVendite(state.vendite);
