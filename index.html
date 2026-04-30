@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MailListRepo — Vendite, Ordini e Mail List</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1f2328;
+    background: #f6f8fa;
+    margin: 0;
+    padding: 24px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { margin: 0 0 8px; font-size: 24px; }
+  h2 { margin: 0 0 12px; font-size: 19px; }
+  p.lead { color: #57606a; margin: 0 0 24px; }
+  .card {
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .uploaders {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+  @media (max-width: 800px) {
+    .uploaders { grid-template-columns: 1fr; }
+  }
+  .uploader label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 6px;
+    font-size: 14px;
+  }
+  .uploader .hint {
+    font-size: 12px;
+    color: #57606a;
+    margin-bottom: 8px;
+  }
+  .uploader input[type="file"] {
+    width: 100%;
+    font-size: 13px;
+  }
+  .uploader .status {
+    margin-top: 8px;
+    font-size: 13px;
+    min-height: 18px;
+  }
+  .ok { color: #1a7f37; }
+  .err { color: #cf222e; }
+  .actions { margin-top: 16px; display: flex; gap: 12px; flex-wrap: wrap; }
+  button {
+    background: #1f6feb;
+    color: #fff;
+    border: 0;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:disabled { background: #8c959f; cursor: not-allowed; }
+  button.secondary { background: #2da44e; }
+  #errorBox {
+    display: none;
+    background: #ffebe9;
+    border: 1px solid #ffc1bb;
+    color: #82071e;
+    padding: 12px 16px;
+    border-radius: 6px;
+    margin-bottom: 20px;
+    white-space: pre-wrap;
+    font-size: 14px;
+  }
+  .summary {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+    color: #57606a;
+    font-size: 14px;
+  }
+  .summary strong { color: #1f2328; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    border: 1px solid #d0d7de;
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: #f6f8fa;
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+  }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  .table-scroll {
+    max-height: 480px;
+    overflow: auto;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+  }
+  .table-scroll table { border: 0; }
+  .table-scroll th, .table-scroll td { border-top: 0; border-left: 0; }
+  .table-scroll th:last-child, .table-scroll td:last-child { border-right: 0; }
+  .table-scroll tr:last-child td { border-bottom: 0; }
+  .empty { color: #57606a; font-style: italic; padding: 12px 0; }
+  footer { color: #57606a; font-size: 12px; margin-top: 32px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>MailListRepo</h1>
+  <p class="lead">Carica i 3 file Excel del gestionale. L'elaborazione avviene interamente nel tuo browser: nessun dato viene caricato online.</p>
+
+  <div id="errorBox"></div>
+
+  <div class="card">
+    <h2>1. Carica i file</h2>
+    <div class="uploaders">
+      <div class="uploader">
+        <label for="fileAnagrafica">Anagrafica clienti</label>
+        <div class="hint">Foglio: <code>RUBRICA CONTATTI</code></div>
+        <input type="file" id="fileAnagrafica" accept=".xlsx">
+        <div class="status" id="statusAnagrafica"></div>
+      </div>
+      <div class="uploader">
+        <label for="fileOrdini">Ordini clienti</label>
+        <div class="hint">Foglio: <code>ORDINI CLIENTI DETTAGLIO</code></div>
+        <input type="file" id="fileOrdini" accept=".xlsx">
+        <div class="status" id="statusOrdini"></div>
+      </div>
+      <div class="uploader">
+        <label for="fileVendite">Vendite clienti</label>
+        <div class="hint">Foglio: <code>SPEDIZIONI E RESI CLIENTI DETTA</code></div>
+        <input type="file" id="fileVendite" accept=".xlsx">
+        <div class="status" id="statusVendite"></div>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="btnProcess" disabled>Elabora</button>
+      <button id="btnReset" class="secondary" type="button">Reset</button>
+    </div>
+  </div>
+
+  <div class="card" id="cardVendite" style="display:none">
+    <h2>Vendite</h2>
+    <div class="summary" id="summaryVendite"></div>
+    <div class="table-scroll"><table id="tableVendite"></table></div>
+  </div>
+
+  <div class="card" id="cardOrdini" style="display:none">
+    <h2>Ordini aperti</h2>
+    <div class="summary" id="summaryOrdini"></div>
+    <div class="table-scroll"><table id="tableOrdini"></table></div>
+  </div>
+
+  <div class="card" id="cardMaillist" style="display:none">
+    <h2>Mail List</h2>
+    <div class="summary" id="summaryMaillist"></div>
+    <div class="actions" style="margin-top:0;margin-bottom:12px">
+      <button id="btnDownloadCsv" class="secondary">Scarica CSV</button>
+    </div>
+    <div class="table-scroll"><table id="tableMaillist"></table></div>
+  </div>
+
+  <footer>Tutto avviene nel browser. SheetJS via CDN.</footer>
+</div>
+
+<script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
