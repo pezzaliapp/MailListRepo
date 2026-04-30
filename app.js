@@ -449,7 +449,9 @@ function showError(msg) {
     box.textContent = "";
     return;
   }
-  box.style.display = "";
+  // Must be "block" (not ""): the CSS rule sets display:none, so clearing
+  // the inline style would let the element fall back to hidden.
+  box.style.display = "block";
   box.textContent = msg;
 }
 
@@ -486,20 +488,46 @@ function reset() {
 
 function process() {
   console.log("Elabora cliccato");
-  showError("");
-  const missing = [];
-  if (!state.anagrafica) missing.push("Anagrafica");
-  if (!state.ordini) missing.push("Ordini");
-  if (!state.vendite) missing.push("Vendite");
-  if (missing.length) {
-    showError("Carica tutti e 3 i file prima di elaborare. Mancano: " + missing.join(", "));
-    return;
-  }
   try {
+    console.log("File caricati:", {
+      hasAnagrafica: !!state.anagrafica,
+      hasOrdini: !!state.ordini,
+      hasVendite: !!state.vendite,
+    });
+
+    const missing = [];
+    if (!state.anagrafica) missing.push("Anagrafica");
+    if (!state.ordini) missing.push("Ordini");
+    if (!state.vendite) missing.push("Vendite");
+    if (missing.length) {
+      showError("Carica tutti e 3 i file prima di elaborare. Mancano: " + missing.join(", "));
+      return;
+    }
+
+    showError("");
+
+    console.log("Sheets nei workbook:", {
+      anagrafica: state.anagrafica.SheetNames,
+      ordini: state.ordini.SheetNames,
+      vendite: state.vendite.SheetNames,
+    });
+
     const anagrafica = parseAnagrafica(state.anagrafica);
+    console.log("Anagrafica parsata. Clienti unici:", anagrafica.size);
+
     const vendite = parseVendite(state.vendite);
+    console.log("Vendite parsate. Clienti con vendite:", vendite.size);
+
     const ordini = parseOrdini(state.ordini);
+    console.log("Ordini parsati. Clienti con ordini aperti:", ordini.size);
+
     const maillist = buildMailList(anagrafica, vendite, ordini);
+    console.log("Dopo aggregazione:", {
+      clientiAnagrafica: anagrafica.size,
+      clientiVendite: vendite.size,
+      clientiOrdini: ordini.size,
+      mailListRighe: maillist.length,
+    });
 
     state.result = { anagrafica, vendite, ordini, maillist };
 
@@ -507,10 +535,10 @@ function process() {
     renderOrdini(ordini);
     renderMaillist(maillist);
 
-    // Scroll to first result
     $("cardVendite").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) {
-    showError(err.message || String(err));
+    console.error("Errore in process:", err);
+    showError(err && err.message ? err.message : String(err));
     ["cardVendite", "cardOrdini", "cardMaillist"].forEach((id) => ($(id).style.display = "none"));
   }
 }
