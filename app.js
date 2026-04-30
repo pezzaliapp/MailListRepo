@@ -7,17 +7,22 @@ const SHEETS = {
   vendite: "SPEDIZIONI E RESI CLIENTI DETTA",
 };
 
-// Anagrafica: lettura per nome (nessun nome duplicato che ci interessi).
+// Email da escludere sempre dalla mail list (case-insensitive).
+const EMAIL_ESCLUSE = new Set([
+  "a.pezzali@cormachsrl.com",
+]);
+
+// Anagrafica: lettura per nome (le colonne che ci servono non sono duplicate).
 const COLUMNS = {
   anagrafica: ["CLIENTE", "RAGIONE SOCIALE 1", "EMAIL"],
 };
 
-// Ordini e vendite: lettura per indice di colonna (gli Excel hanno
-// intestazioni duplicate — es. "CLIENTE" due volte negli ordini, e
-// "DESCRIZIONE ELEMENTO" più volte nelle vendite — quindi leggere per nome
-// con sheet_to_json default fa sovrascrivere i duplicati. Header verificato
-// dall'utente sui file di riferimento del 30/04/2026.)
+// Ordini e vendite: lettura per indice di colonna. Le intestazioni sono
+// duplicate (CLIENTE due volte negli ordini, DESCRIZIONE ELEMENTO più volte
+// nelle vendite) quindi sheet_to_json default sovrascrive i duplicati.
+// Indici verificati sui file di riferimento del 30/04/2026.
 const VENDITE_IDX = {
+  anno: 0,        // ANNO SPEDIZIONE
   tipo: 1,        // TIPO SPEDIZIONE   ("R…" = reso)
   data: 7,        // DATA SPEDIZIONE
   cliente: 10,    // CLIENTE (codice numerico)
@@ -28,6 +33,7 @@ const VENDITE_IDX = {
   importo: 25,    // IMPORTO CONSEGNATO
 };
 const VENDITE_HEADER_CHECK = {
+  0: "ANNO SPEDIZIONE",
   1: "TIPO SPEDIZIONE",
   7: "DATA SPEDIZIONE",
   10: "CLIENTE",
@@ -37,16 +43,18 @@ const VENDITE_HEADER_CHECK = {
   25: "IMPORTO CONSEGNATO",
 };
 const ORDINI_IDX = {
+  anno: 0,        // ANNO
   num: 2,         // NUM.
   data: 6,        // DATA CREAZIONE
   cliente: 7,     // CLIENTE (codice, prima occorrenza)
-  ragione: 12,    // CLIENTE (ragione sociale, seconda occorrenza — era CLIENTE.1 in pandas)
+  ragione: 12,    // CLIENTE (ragione sociale, seconda occorrenza)
   articolo: 13,   // ARTICOLO
   descrizione: 20, // DESCRIZIONE
   qtaInevasa: 24, // QTA INEVASA
   importoInevaso: 25, // IMPORTO INEVASO
 };
 const ORDINI_HEADER_CHECK = {
+  0: "ANNO",
   2: "NUM.",
   6: "DATA CREAZIONE",
   7: "CLIENTE",
@@ -57,10 +65,18 @@ const ORDINI_HEADER_CHECK = {
 };
 
 const state = {
-  anagrafica: null,
-  ordini: null,
-  vendite: null,
-  result: null,
+  // workbook caricati ma non ancora elaborati
+  wbAnagrafica: null,
+  wbOrdini: null,
+  wbVendite: null,
+  // dati parsati (popolati da process())
+  anagrafica: null,    // Map<code, { ragione, emails: Set<string> }>
+  venditeRows: null,   // Array<{ anno, code, ragione, isReso, importo, date }>
+  ordiniRows: null,    // Array<{ anno, code, ragione, num, backlog, articolo, descrizione, data }>
+  years: [],           // anni distinti, decrescente
+  filtroAnno: null,    // null = tutti, altrimenti number
+  // risultato corrente del filtro (popolato da recomputeAndRender)
+  result: null,        // { vendite: Map, ordini: Map, maillist: Array }
 };
 
 // ---------- Utilità ----------
@@ -97,7 +113,6 @@ const toDate = (v) => {
   if (!v) return null;
   if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
   if (typeof v === "number") {
-    // Excel serial date fallback
     const epoch = new Date(Date.UTC(1899, 11, 30));
     const d = new Date(epoch.getTime() + v * 86400000);
     return isNaN(d.getTime()) ? null : d;
@@ -115,10 +130,20 @@ const toDate = (v) => {
   return isNaN(dt.getTime()) ? null : dt;
 };
 
+const toYear = (annoCell, fallbackDate) => {
+  if (annoCell !== null && annoCell !== undefined && annoCell !== "") {
+    const n = parseInt(annoCell, 10);
+    if (!isNaN(n)) return n;
+  }
+  if (fallbackDate instanceof Date && !isNaN(fallbackDate.getTime())) {
+    return fallbackDate.getFullYear();
+  }
+  return null;
+};
+
 const isValidEmail = (s) => {
   if (!s) return false;
-  const t = String(s).trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s).trim());
 };
 
 const findSheet = (workbook, wanted) => {
@@ -171,35 +196,32 @@ const readWorkbook = (file) =>
     reader.readAsArrayBuffer(file);
   });
 
-const sheetRows = (sheet) =>
-  XLSX.utils.sheet_to_json(sheet, { defval: null, raw: false });
-
-// raw:false converts numbers/dates already; we'll re-parse with our helpers anyway.
-// But dates from cellDates:true come as ISO strings if raw:false — switch to raw:true for dates.
-// Safer: read with two passes — use raw:true for numeric/date parsing.
-const sheetRowsRaw = (sheet) =>
-  XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
-
-// ---------- Parsing per file ----------
+// ---------- Parsing ----------
 
 function parseAnagrafica(workbook) {
   const sheet = findSheet(workbook, SHEETS.anagrafica);
   if (!sheet) throw new Error(`Anagrafica: foglio "${SHEETS.anagrafica}" non trovato.`);
-  const rows = sheetRowsRaw(sheet);
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
   console.log("Anagrafica:", rows.length, "righe, prima riga:", rows[0]);
   checkColumns(rows, COLUMNS.anagrafica, "Anagrafica");
 
-  // Una riga = un cliente. Email singola (può essere vuota).
-  const map = new Map(); // code -> { ragione, email }
+  // Più righe possono avere lo stesso CLIENTE, una per email. Aggreghiamo.
+  const map = new Map(); // code -> { ragione, emails: Set }
   for (const r of rows) {
     const codeRaw = r["CLIENTE"];
     if (codeRaw === null || codeRaw === undefined || codeRaw === "") continue;
     const code = String(codeRaw).trim();
     if (!code) continue;
+    if (!map.has(code)) {
+      map.set(code, { ragione: "", emails: new Set() });
+    }
+    const e = map.get(code);
     const ragione = r["RAGIONE SOCIALE 1"] ? String(r["RAGIONE SOCIALE 1"]).trim() : "";
+    if (!e.ragione && ragione) e.ragione = ragione;
     const emailRaw = r["EMAIL"] ? String(r["EMAIL"]).trim().toLowerCase() : "";
-    const email = isValidEmail(emailRaw) ? emailRaw : "";
-    map.set(code, { ragione, email });
+    if (emailRaw && isValidEmail(emailRaw) && !EMAIL_ESCLUSE.has(emailRaw)) {
+      e.emails.add(emailRaw);
+    }
   }
   return map;
 }
@@ -214,7 +236,7 @@ function parseVendite(workbook) {
   checkHeaderAt(headers, VENDITE_HEADER_CHECK, "Vendite");
 
   const I = VENDITE_IDX;
-  const agg = new Map(); // code -> { ragione, count, revenue, lastDate }
+  const out = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     const codeRaw = row[I.cliente];
@@ -223,22 +245,18 @@ function parseVendite(workbook) {
     if (!code) continue;
 
     const tipo = row[I.tipo];
-    const isReso = tipo && String(tipo).trim().toUpperCase().startsWith("R");
-    const importo = toNumber(row[I.importo]);
-    const signed = isReso ? -importo : importo;
+    const isReso = !!(tipo && String(tipo).trim().toUpperCase().startsWith("R"));
     const date = toDate(row[I.data]);
-    const ragRow = row[I.ragione] ? String(row[I.ragione]).trim() : "";
-
-    if (!agg.has(code)) {
-      agg.set(code, { ragione: ragRow, count: 0, revenue: 0, lastDate: null });
-    }
-    const e = agg.get(code);
-    if (!e.ragione && ragRow) e.ragione = ragRow;
-    e.count += 1;
-    e.revenue += signed;
-    if (date && (!e.lastDate || date > e.lastDate)) e.lastDate = date;
+    out.push({
+      anno: toYear(row[I.anno], date),
+      code,
+      ragione: row[I.ragione] ? String(row[I.ragione]).trim() : "",
+      isReso,
+      importo: toNumber(row[I.importo]),
+      date,
+    });
   }
-  return agg;
+  return out;
 }
 
 function parseOrdini(workbook) {
@@ -251,7 +269,7 @@ function parseOrdini(workbook) {
   checkHeaderAt(headers, ORDINI_HEADER_CHECK, "Ordini");
 
   const I = ORDINI_IDX;
-  const agg = new Map(); // code -> { ragione, orders: Set, backlog, articoli: [] }
+  const out = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     const qta = toNumber(row[I.qtaInevasa]);
@@ -263,27 +281,57 @@ function parseOrdini(workbook) {
     const code = String(codeRaw).trim();
     if (!code) continue;
 
-    const ragRow = row[I.ragione] ? String(row[I.ragione]).trim() : "";
+    const date = toDate(row[I.data]);
+    const numRaw = row[I.num];
+    out.push({
+      anno: toYear(row[I.anno], date),
+      code,
+      ragione: row[I.ragione] ? String(row[I.ragione]).trim() : "",
+      num: numRaw !== null && numRaw !== undefined && numRaw !== "" ? String(numRaw).trim() : "",
+      backlog: imp,
+      articolo: row[I.articolo] ? String(row[I.articolo]).trim() : "",
+      descrizione: row[I.descrizione] ? String(row[I.descrizione]).trim() : "",
+      data: date,
+    });
+  }
+  return out;
+}
 
-    if (!agg.has(code)) {
-      agg.set(code, { ragione: ragRow, orders: new Set(), backlog: 0, articoli: [] });
+// ---------- Aggregazioni in funzione del filtro anno ----------
+
+function aggregateVendite(records, year) {
+  const agg = new Map(); // code -> { ragione, count, revenue, lastDate }
+  for (const r of records) {
+    if (year !== null && r.anno !== year) continue;
+    const signed = r.isReso ? -r.importo : r.importo;
+    if (!agg.has(r.code)) {
+      agg.set(r.code, { ragione: r.ragione, count: 0, revenue: 0, lastDate: null });
     }
-    const e = agg.get(code);
-    if (!e.ragione && ragRow) e.ragione = ragRow;
-    const num = row[I.num];
-    if (num !== null && num !== undefined && num !== "") {
-      e.orders.add(String(num).trim());
-    }
-    e.backlog += imp;
-    const art = row[I.articolo] ? String(row[I.articolo]).trim() : "";
-    const desc = row[I.descrizione] ? String(row[I.descrizione]).trim() : "";
-    const label = [art, desc].filter(Boolean).join(" — ");
-    if (label && !e.articoli.includes(label)) e.articoli.push(label);
+    const e = agg.get(r.code);
+    if (!e.ragione && r.ragione) e.ragione = r.ragione;
+    e.count += 1;
+    e.revenue += signed;
+    if (r.date && (!e.lastDate || r.date > e.lastDate)) e.lastDate = r.date;
   }
   return agg;
 }
 
-// ---------- Composizione mail list ----------
+function aggregateOrdini(records, year) {
+  const agg = new Map(); // code -> { ragione, orders: Set, backlog, articoli: [] }
+  for (const r of records) {
+    if (year !== null && r.anno !== year) continue;
+    if (!agg.has(r.code)) {
+      agg.set(r.code, { ragione: r.ragione, orders: new Set(), backlog: 0, articoli: [] });
+    }
+    const e = agg.get(r.code);
+    if (!e.ragione && r.ragione) e.ragione = r.ragione;
+    if (r.num) e.orders.add(r.num);
+    e.backlog += r.backlog;
+    const label = [r.articolo, r.descrizione].filter(Boolean).join(" — ");
+    if (label && !e.articoli.includes(label)) e.articoli.push(label);
+  }
+  return agg;
+}
 
 function buildMailList(anagrafica, vendite, ordini) {
   const out = [];
@@ -291,17 +339,13 @@ function buildMailList(anagrafica, vendite, ordini) {
     const hasSales = vendite.has(code);
     const hasOpenOrders = ordini.has(code);
     if (!hasSales && !hasOpenOrders) continue;
-    if (!info.email) continue;
+    if (info.emails.size === 0) continue;
     let ragione = info.ragione;
     if (!ragione && hasSales) ragione = vendite.get(code).ragione;
     if (!ragione && hasOpenOrders) ragione = ordini.get(code).ragione;
-    out.push({
-      email: info.email,
-      code,
-      ragione: ragione || "",
-      hasSales,
-      hasOpenOrders,
-    });
+    for (const email of info.emails) {
+      out.push({ email, code, ragione: ragione || "", hasSales, hasOpenOrders });
+    }
   }
   out.sort((a, b) => a.email.localeCompare(b.email));
   return out;
@@ -311,10 +355,18 @@ function buildMailList(anagrafica, vendite, ordini) {
 
 const $ = (id) => document.getElementById(id);
 
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function renderTable(target, headers, rows) {
   const t = $(target);
   if (!rows.length) {
-    t.innerHTML = `<tr><td class="empty">Nessun dato.</td></tr>`;
+    t.innerHTML = `<tr><td class="empty" colspan="${headers.length}">Nessun dato.</td></tr>`;
     return;
   }
   const thead =
@@ -324,54 +376,40 @@ function renderTable(target, headers, rows) {
   const tbody =
     "<tbody>" +
     rows
-      .map(
-        (r) =>
-          "<tr>" +
-          headers
-            .map((h) => `<td class="${h.num ? "num" : ""}">${escapeHtml(r[h.key] ?? "")}</td>`)
-            .join("") +
-          "</tr>"
-      )
-      .join("") +
+      .map((r) =>
+        "<tr>" +
+        headers.map((h) => `<td class="${h.num ? "num" : ""}">${escapeHtml(r[h.key] ?? "")}</td>`).join("") +
+        "</tr>"
+      ).join("") +
     "</tbody>";
   t.innerHTML = thead + tbody;
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function annoLabel() {
+  return state.filtroAnno === null ? "tutti gli anni" : `anno ${state.filtroAnno}`;
 }
 
 function renderVendite(vendite) {
   const arr = [];
-  let totaleFatturato = 0;
+  let totale = 0;
   for (const [code, e] of vendite) {
-    arr.push({
-      code,
-      ragione: e.ragione,
-      count: e.count,
-      revenue: e.revenue,
-      lastDate: e.lastDate,
-    });
-    totaleFatturato += e.revenue;
+    arr.push({ code, ragione: e.ragione, count: e.count, revenue: e.revenue, lastDate: e.lastDate });
+    totale += e.revenue;
   }
   arr.sort((a, b) => b.revenue - a.revenue);
 
   $("summaryVendite").innerHTML =
-    `<span><strong>${fmtInt(arr.length)}</strong> clienti con acquisti</span>` +
-    `<span>fatturato totale storico: <strong>${fmtEuro(totaleFatturato)}</strong></span>`;
+    `<span><strong>${fmtInt(arr.length)}</strong> clienti con acquisti (${annoLabel()})</span>` +
+    `<span>fatturato totale: <strong>${fmtEuro(totale)}</strong></span>`;
 
   renderTable(
     "tableVendite",
     [
-      { key: "code", label: "Codice", num: false },
-      { key: "ragione", label: "Ragione sociale", num: false },
+      { key: "code", label: "Codice" },
+      { key: "ragione", label: "Ragione sociale" },
       { key: "countF", label: "Spedizioni", num: true },
       { key: "revenueF", label: "Fatturato", num: true },
-      { key: "lastDateF", label: "Ultimo acquisto", num: false },
+      { key: "lastDateF", label: "Ultimo acquisto" },
     ],
     arr.map((r) => ({
       ...r,
@@ -399,17 +437,17 @@ function renderOrdini(ordini) {
   arr.sort((a, b) => b.backlog - a.backlog);
 
   $("summaryOrdini").innerHTML =
-    `<span><strong>${fmtInt(arr.length)}</strong> clienti con ordini aperti</span>` +
+    `<span><strong>${fmtInt(arr.length)}</strong> clienti con ordini aperti (${annoLabel()})</span>` +
     `<span>backlog totale: <strong>${fmtEuro(backlogTot)}</strong></span>`;
 
   renderTable(
     "tableOrdini",
     [
-      { key: "code", label: "Codice", num: false },
-      { key: "ragione", label: "Ragione sociale", num: false },
+      { key: "code", label: "Codice" },
+      { key: "ragione", label: "Ragione sociale" },
       { key: "ordersF", label: "Ordini aperti", num: true },
       { key: "backlogF", label: "Backlog", num: true },
-      { key: "articoli", label: "Articoli (max 3)", num: false },
+      { key: "articoli", label: "Articoli (max 3)" },
     ],
     arr.map((r) => ({
       ...r,
@@ -422,15 +460,15 @@ function renderOrdini(ordini) {
 
 function renderMaillist(list) {
   $("summaryMaillist").innerHTML =
-    `<span><strong>${fmtInt(list.length)}</strong> indirizzi email</span>`;
+    `<span><strong>${fmtInt(list.length)}</strong> indirizzi email (${annoLabel()})</span>`;
   renderTable(
     "tableMaillist",
     [
-      { key: "email", label: "Email", num: false },
-      { key: "code", label: "Codice", num: false },
-      { key: "ragione", label: "Ragione sociale", num: false },
-      { key: "salesF", label: "Ha acquistato?", num: false },
-      { key: "ordersF", label: "Ordini aperti?", num: false },
+      { key: "email", label: "Email" },
+      { key: "code", label: "Codice" },
+      { key: "ragione", label: "Ragione sociale" },
+      { key: "salesF", label: "Ha acquistato?" },
+      { key: "ordersF", label: "Ordini aperti?" },
     ],
     list.map((r) => ({
       ...r,
@@ -441,40 +479,67 @@ function renderMaillist(list) {
   $("cardMaillist").style.display = "";
 }
 
-// ---------- CSV ----------
-
-function toCsv(list) {
-  const headers = ["Email", "Codice cliente", "Ragione sociale", "Ha acquistato?", "Ha ordini aperti?"];
-  const escape = (v) => {
-    const s = v === null || v === undefined ? "" : String(v);
-    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-    return s;
-  };
-  const lines = [headers.map(escape).join(",")];
-  for (const r of list) {
-    lines.push(
-      [
-        r.email,
-        r.code,
-        r.ragione,
-        r.hasSales ? "Sì" : "No",
-        r.hasOpenOrders ? "Sì" : "No",
-      ].map(escape).join(",")
-    );
-  }
-  return "﻿" + lines.join("\r\n");
+function recomputeAndRender() {
+  if (!state.anagrafica || !state.venditeRows || !state.ordiniRows) return;
+  const year = state.filtroAnno;
+  const vendite = aggregateVendite(state.venditeRows, year);
+  const ordini = aggregateOrdini(state.ordiniRows, year);
+  const maillist = buildMailList(state.anagrafica, vendite, ordini);
+  state.result = { vendite, ordini, maillist };
+  console.log("Render:", {
+    annoFiltro: year,
+    clientiVendite: vendite.size,
+    clientiOrdini: ordini.size,
+    mailListRighe: maillist.length,
+  });
+  renderVendite(vendite);
+  renderOrdini(ordini);
+  renderMaillist(maillist);
 }
 
-function downloadCsv(list) {
-  const blob = new Blob([toCsv(list)], { type: "text/csv;charset=utf-8" });
+// ---------- Export ----------
+
+function triggerDownload(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "maillist.csv";
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const MAILLIST_HEADERS = ["Email", "Codice cliente", "Ragione sociale", "Ha acquistato?", "Ha ordini aperti?"];
+const maillistRow = (r) => [r.email, r.code, r.ragione, r.hasSales ? "Sì" : "No", r.hasOpenOrders ? "Sì" : "No"];
+
+function downloadCsv(list) {
+  const escape = (v) => {
+    const s = v === null || v === undefined ? "" : String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [MAILLIST_HEADERS.map(escape).join(",")];
+  for (const r of list) lines.push(maillistRow(r).map(escape).join(","));
+  const content = "﻿" + lines.join("\r\n");
+  triggerDownload(new Blob([content], { type: "text/csv;charset=utf-8" }), "maillist.csv");
+}
+
+function downloadXlsx(list) {
+  const aoa = [MAILLIST_HEADERS, ...list.map(maillistRow)];
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  XLSX.utils.book_append_sheet(wb, ws, "MailList");
+  const buf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+  triggerDownload(
+    new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    "maillist.xlsx"
+  );
+}
+
+function downloadTxt(list) {
+  // Solo email, una per riga, UTF-8 senza BOM, fine riga \n.
+  const text = list.map((r) => r.email).join("\n") + (list.length ? "\n" : "");
+  triggerDownload(new Blob([text], { type: "text/plain;charset=utf-8" }), "maillist.txt");
 }
 
 // ---------- UI wiring ----------
@@ -492,13 +557,12 @@ function showError(msg) {
     box.textContent = "";
     return;
   }
-  // Must be "block" (not ""): the CSS rule sets display:none, so clearing
-  // the inline style would let the element fall back to hidden.
+  // "block" esplicito: la regola CSS imposta display:none, quindi clear inline non basta.
   box.style.display = "block";
   box.textContent = msg;
 }
 
-function bindFile(inputId, statusId, key, label) {
+function bindFile(inputId, statusId, key) {
   $(inputId).addEventListener("change", async (ev) => {
     const f = ev.target.files[0];
     if (!f) {
@@ -518,14 +582,35 @@ function bindFile(inputId, statusId, key, label) {
   });
 }
 
+function populateYearSelect(years) {
+  const sel = $("filtroAnno");
+  sel.innerHTML = "";
+  const optAll = document.createElement("option");
+  optAll.value = "";
+  optAll.textContent = "Tutti gli anni";
+  sel.appendChild(optAll);
+  for (const y of years) {
+    const o = document.createElement("option");
+    o.value = String(y);
+    o.textContent = String(y);
+    sel.appendChild(o);
+  }
+  sel.value = "";
+}
+
 function reset() {
+  state.wbAnagrafica = null;
+  state.wbOrdini = null;
+  state.wbVendite = null;
   state.anagrafica = null;
-  state.ordini = null;
-  state.vendite = null;
+  state.venditeRows = null;
+  state.ordiniRows = null;
+  state.years = [];
+  state.filtroAnno = null;
   state.result = null;
   ["fileAnagrafica", "fileOrdini", "fileVendite"].forEach((id) => ($(id).value = ""));
   ["statusAnagrafica", "statusOrdini", "statusVendite"].forEach((id) => setStatus(id, "", true));
-  ["cardVendite", "cardOrdini", "cardMaillist"].forEach((id) => ($(id).style.display = "none"));
+  ["cardFiltro", "cardVendite", "cardOrdini", "cardMaillist"].forEach((id) => ($(id).style.display = "none"));
   showError("");
 }
 
@@ -533,66 +618,72 @@ function process() {
   console.log("Elabora cliccato");
   try {
     console.log("File caricati:", {
-      hasAnagrafica: !!state.anagrafica,
-      hasOrdini: !!state.ordini,
-      hasVendite: !!state.vendite,
+      hasAnagrafica: !!state.wbAnagrafica,
+      hasOrdini: !!state.wbOrdini,
+      hasVendite: !!state.wbVendite,
     });
 
     const missing = [];
-    if (!state.anagrafica) missing.push("Anagrafica");
-    if (!state.ordini) missing.push("Ordini");
-    if (!state.vendite) missing.push("Vendite");
+    if (!state.wbAnagrafica) missing.push("Anagrafica");
+    if (!state.wbOrdini) missing.push("Ordini");
+    if (!state.wbVendite) missing.push("Vendite");
     if (missing.length) {
       showError("Carica tutti e 3 i file prima di elaborare. Mancano: " + missing.join(", "));
       return;
     }
-
     showError("");
 
-    console.log("Sheets nei workbook:", {
-      anagrafica: state.anagrafica.SheetNames,
-      ordini: state.ordini.SheetNames,
-      vendite: state.vendite.SheetNames,
-    });
-
-    const anagrafica = parseAnagrafica(state.anagrafica);
+    const anagrafica = parseAnagrafica(state.wbAnagrafica);
     console.log("Anagrafica parsata. Clienti unici:", anagrafica.size);
 
-    const vendite = parseVendite(state.vendite);
-    console.log("Vendite parsate. Clienti con vendite:", vendite.size);
+    const venditeRows = parseVendite(state.wbVendite);
+    console.log("Vendite parsate. Righe utili:", venditeRows.length);
 
-    const ordini = parseOrdini(state.ordini);
-    console.log("Ordini parsati. Clienti con ordini aperti:", ordini.size);
+    const ordiniRows = parseOrdini(state.wbOrdini);
+    console.log("Ordini parsati. Righe aperte:", ordiniRows.length);
 
-    const maillist = buildMailList(anagrafica, vendite, ordini);
-    console.log("Dopo aggregazione:", {
-      clientiAnagrafica: anagrafica.size,
-      clientiVendite: vendite.size,
-      clientiOrdini: ordini.size,
-      mailListRighe: maillist.length,
-    });
+    const yearSet = new Set();
+    for (const r of venditeRows) if (r.anno !== null) yearSet.add(r.anno);
+    for (const r of ordiniRows) if (r.anno !== null) yearSet.add(r.anno);
+    const years = [...yearSet].sort((a, b) => b - a);
+    console.log("Anni distinti:", years);
 
-    state.result = { anagrafica, vendite, ordini, maillist };
+    state.anagrafica = anagrafica;
+    state.venditeRows = venditeRows;
+    state.ordiniRows = ordiniRows;
+    state.years = years;
+    state.filtroAnno = null;
 
-    renderVendite(vendite);
-    renderOrdini(ordini);
-    renderMaillist(maillist);
+    populateYearSelect(years);
+    $("cardFiltro").style.display = "";
 
-    $("cardVendite").scrollIntoView({ behavior: "smooth", block: "start" });
+    recomputeAndRender();
+    $("cardFiltro").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) {
     console.error("Errore in process:", err);
     showError(err && err.message ? err.message : String(err));
-    ["cardVendite", "cardOrdini", "cardMaillist"].forEach((id) => ($(id).style.display = "none"));
+    ["cardFiltro", "cardVendite", "cardOrdini", "cardMaillist"].forEach((id) => ($(id).style.display = "none"));
   }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  bindFile("fileAnagrafica", "statusAnagrafica", "anagrafica", "Anagrafica");
-  bindFile("fileOrdini", "statusOrdini", "ordini", "Ordini");
-  bindFile("fileVendite", "statusVendite", "vendite", "Vendite");
+  bindFile("fileAnagrafica", "statusAnagrafica", "wbAnagrafica");
+  bindFile("fileOrdini", "statusOrdini", "wbOrdini");
+  bindFile("fileVendite", "statusVendite", "wbVendite");
   $("btnProcess").addEventListener("click", process);
   $("btnReset").addEventListener("click", reset);
+  $("filtroAnno").addEventListener("change", (ev) => {
+    const v = ev.target.value;
+    state.filtroAnno = v === "" ? null : Number(v);
+    recomputeAndRender();
+  });
   $("btnDownloadCsv").addEventListener("click", () => {
     if (state.result && state.result.maillist) downloadCsv(state.result.maillist);
+  });
+  $("btnDownloadXlsx").addEventListener("click", () => {
+    if (state.result && state.result.maillist) downloadXlsx(state.result.maillist);
+  });
+  $("btnDownloadTxt").addEventListener("click", () => {
+    if (state.result && state.result.maillist) downloadTxt(state.result.maillist);
   });
 });
