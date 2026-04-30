@@ -8,7 +8,7 @@ const SHEETS = {
 };
 
 const COLUMNS = {
-  anagrafica: ["CONTATTO CLIENTI", "RAGIONE SOCIALE 1", "EMAIL"],
+  anagrafica: ["CLIENTE", "RAGIONE SOCIALE 1", "EMAIL"],
   ordini: [
     "CLIENTE", "CLIENTE.1", "NUM.", "DATA CREAZIONE",
     "ARTICOLO", "DESCRIZIONE", "QTA INEVASA", "IMPORTO INEVASO",
@@ -137,28 +137,20 @@ function parseAnagrafica(workbook) {
   const sheet = findSheet(workbook, SHEETS.anagrafica);
   if (!sheet) throw new Error(`Anagrafica: foglio "${SHEETS.anagrafica}" non trovato.`);
   const rows = sheetRowsRaw(sheet);
+  console.log("Anagrafica:", rows.length, "righe, prima riga:", rows[0]);
   checkColumns(rows, COLUMNS.anagrafica, "Anagrafica");
 
-  const map = new Map(); // code -> { ragione, emails: Set }
+  // Una riga = un cliente. Email singola (può essere vuota).
+  const map = new Map(); // code -> { ragione, email }
   for (const r of rows) {
-    const codeRaw = r["CONTATTO CLIENTI"];
+    const codeRaw = r["CLIENTE"];
     if (codeRaw === null || codeRaw === undefined || codeRaw === "") continue;
     const code = String(codeRaw).trim();
     if (!code) continue;
-    if (!map.has(code)) {
-      map.set(code, { ragione: "", emails: new Set() });
-    }
-    const e = map.get(code);
-    const rag = r["RAGIONE SOCIALE 1"];
-    if (!e.ragione && rag) e.ragione = String(rag).trim();
-    const email = r["EMAIL"];
-    if (email) {
-      String(email)
-        .split(/[;,]/)
-        .map((x) => x.trim().toLowerCase())
-        .filter((x) => isValidEmail(x))
-        .forEach((x) => e.emails.add(x));
-    }
+    const ragione = r["RAGIONE SOCIALE 1"] ? String(r["RAGIONE SOCIALE 1"]).trim() : "";
+    const emailRaw = r["EMAIL"] ? String(r["EMAIL"]).trim().toLowerCase() : "";
+    const email = isValidEmail(emailRaw) ? emailRaw : "";
+    map.set(code, { ragione, email });
   }
   return map;
 }
@@ -246,19 +238,17 @@ function buildMailList(anagrafica, vendite, ordini) {
     const hasSales = vendite.has(code);
     const hasOpenOrders = ordini.has(code);
     if (!hasSales && !hasOpenOrders) continue;
-    if (info.emails.size === 0) continue;
+    if (!info.email) continue;
     let ragione = info.ragione;
     if (!ragione && hasSales) ragione = vendite.get(code).ragione;
     if (!ragione && hasOpenOrders) ragione = ordini.get(code).ragione;
-    for (const email of info.emails) {
-      out.push({
-        email,
-        code,
-        ragione: ragione || "",
-        hasSales,
-        hasOpenOrders,
-      });
-    }
+    out.push({
+      email: info.email,
+      code,
+      ragione: ragione || "",
+      hasSales,
+      hasOpenOrders,
+    });
   }
   out.sort((a, b) => a.email.localeCompare(b.email));
   return out;
