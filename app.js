@@ -7,17 +7,53 @@ const SHEETS = {
   vendite: "SPEDIZIONI E RESI CLIENTI DETTA",
 };
 
+// Anagrafica: lettura per nome (nessun nome duplicato che ci interessi).
 const COLUMNS = {
   anagrafica: ["CLIENTE", "RAGIONE SOCIALE 1", "EMAIL"],
-  ordini: [
-    "CLIENTE", "CLIENTE.1", "NUM.", "DATA CREAZIONE",
-    "ARTICOLO", "DESCRIZIONE", "QTA INEVASA", "IMPORTO INEVASO",
-  ],
-  vendite: [
-    "CLIENTE", "RAGIONE SOCIALE 1", "DATA SPEDIZIONE",
-    "ARTICOLO", "DESCRIZIONE", "QTA CONSEGNATA", "IMPORTO CONSEGNATO",
-    "TIPO SPEDIZIONE",
-  ],
+};
+
+// Ordini e vendite: lettura per indice di colonna (gli Excel hanno
+// intestazioni duplicate — es. "CLIENTE" due volte negli ordini, e
+// "DESCRIZIONE ELEMENTO" più volte nelle vendite — quindi leggere per nome
+// con sheet_to_json default fa sovrascrivere i duplicati. Header verificato
+// dall'utente sui file di riferimento del 30/04/2026.)
+const VENDITE_IDX = {
+  tipo: 1,        // TIPO SPEDIZIONE   ("R…" = reso)
+  data: 7,        // DATA SPEDIZIONE
+  cliente: 10,    // CLIENTE (codice numerico)
+  ragione: 16,    // RAGIONE SOCIALE 1
+  articolo: 19,   // ARTICOLO
+  descrizione: 22, // DESCRIZIONE
+  qta: 23,        // QTA CONSEGNATA
+  importo: 25,    // IMPORTO CONSEGNATO
+};
+const VENDITE_HEADER_CHECK = {
+  1: "TIPO SPEDIZIONE",
+  7: "DATA SPEDIZIONE",
+  10: "CLIENTE",
+  16: "RAGIONE SOCIALE 1",
+  19: "ARTICOLO",
+  23: "QTA CONSEGNATA",
+  25: "IMPORTO CONSEGNATO",
+};
+const ORDINI_IDX = {
+  num: 2,         // NUM.
+  data: 6,        // DATA CREAZIONE
+  cliente: 7,     // CLIENTE (codice, prima occorrenza)
+  ragione: 12,    // CLIENTE (ragione sociale, seconda occorrenza — era CLIENTE.1 in pandas)
+  articolo: 13,   // ARTICOLO
+  descrizione: 20, // DESCRIZIONE
+  qtaInevasa: 24, // QTA INEVASA
+  importoInevaso: 25, // IMPORTO INEVASO
+};
+const ORDINI_HEADER_CHECK = {
+  2: "NUM.",
+  6: "DATA CREAZIONE",
+  7: "CLIENTE",
+  12: "CLIENTE",
+  13: "ARTICOLO",
+  24: "QTA INEVASA",
+  25: "IMPORTO INEVASO",
 };
 
 const state = {
@@ -104,6 +140,19 @@ const checkColumns = (rows, required, label) => {
   }
 };
 
+const checkHeaderAt = (headers, expected, label) => {
+  const norm = (s) => String(s || "").trim().toUpperCase();
+  const errs = [];
+  for (const idx of Object.keys(expected)) {
+    const want = norm(expected[idx]);
+    const got = norm(headers[idx]);
+    if (got !== want) errs.push(`[${idx}] attesa "${expected[idx]}", trovata "${headers[idx] ?? ""}"`);
+  }
+  if (errs.length) {
+    throw new Error(`${label}: header non corrisponde alla struttura attesa.\n${errs.join("\n")}`);
+  }
+};
+
 const readWorkbook = (file) =>
   new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -158,32 +207,33 @@ function parseAnagrafica(workbook) {
 function parseVendite(workbook) {
   const sheet = findSheet(workbook, SHEETS.vendite);
   if (!sheet) throw new Error(`Vendite: foglio "${SHEETS.vendite}" non trovato.`);
-  const rows = sheetRowsRaw(sheet);
-  checkColumns(rows, COLUMNS.vendite, "Vendite");
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: true });
+  if (!rows.length) throw new Error("Vendite: nessuna riga trovata.");
+  const headers = rows[0];
+  console.log("Vendite headers:", headers);
+  checkHeaderAt(headers, VENDITE_HEADER_CHECK, "Vendite");
 
+  const I = VENDITE_IDX;
   const agg = new Map(); // code -> { ragione, count, revenue, lastDate }
-  for (const r of rows) {
-    const codeRaw = r["CLIENTE"];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const codeRaw = row[I.cliente];
     if (codeRaw === null || codeRaw === undefined || codeRaw === "") continue;
     const code = String(codeRaw).trim();
     if (!code) continue;
 
-    const tipo = r["TIPO SPEDIZIONE"];
+    const tipo = row[I.tipo];
     const isReso = tipo && String(tipo).trim().toUpperCase().startsWith("R");
-    const importo = toNumber(r["IMPORTO CONSEGNATO"]);
+    const importo = toNumber(row[I.importo]);
     const signed = isReso ? -importo : importo;
-    const date = toDate(r["DATA SPEDIZIONE"]);
+    const date = toDate(row[I.data]);
+    const ragRow = row[I.ragione] ? String(row[I.ragione]).trim() : "";
 
     if (!agg.has(code)) {
-      agg.set(code, {
-        ragione: r["RAGIONE SOCIALE 1"] ? String(r["RAGIONE SOCIALE 1"]).trim() : "",
-        count: 0,
-        revenue: 0,
-        lastDate: null,
-      });
+      agg.set(code, { ragione: ragRow, count: 0, revenue: 0, lastDate: null });
     }
     const e = agg.get(code);
-    if (!e.ragione && r["RAGIONE SOCIALE 1"]) e.ragione = String(r["RAGIONE SOCIALE 1"]).trim();
+    if (!e.ragione && ragRow) e.ragione = ragRow;
     e.count += 1;
     e.revenue += signed;
     if (date && (!e.lastDate || date > e.lastDate)) e.lastDate = date;
@@ -194,36 +244,39 @@ function parseVendite(workbook) {
 function parseOrdini(workbook) {
   const sheet = findSheet(workbook, SHEETS.ordini);
   if (!sheet) throw new Error(`Ordini: foglio "${SHEETS.ordini}" non trovato.`);
-  const rows = sheetRowsRaw(sheet);
-  checkColumns(rows, COLUMNS.ordini, "Ordini");
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", raw: true });
+  if (!rows.length) throw new Error("Ordini: nessuna riga trovata.");
+  const headers = rows[0];
+  console.log("Ordini headers:", headers);
+  checkHeaderAt(headers, ORDINI_HEADER_CHECK, "Ordini");
 
+  const I = ORDINI_IDX;
   const agg = new Map(); // code -> { ragione, orders: Set, backlog, articoli: [] }
-  for (const r of rows) {
-    const qta = toNumber(r["QTA INEVASA"]);
-    const imp = toNumber(r["IMPORTO INEVASO"]);
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const qta = toNumber(row[I.qtaInevasa]);
+    const imp = toNumber(row[I.importoInevaso]);
     if (qta <= 0 && imp <= 0) continue;
 
-    const codeRaw = r["CLIENTE"];
+    const codeRaw = row[I.cliente];
     if (codeRaw === null || codeRaw === undefined || codeRaw === "") continue;
     const code = String(codeRaw).trim();
     if (!code) continue;
 
+    const ragRow = row[I.ragione] ? String(row[I.ragione]).trim() : "";
+
     if (!agg.has(code)) {
-      agg.set(code, {
-        ragione: r["CLIENTE.1"] ? String(r["CLIENTE.1"]).trim() : "",
-        orders: new Set(),
-        backlog: 0,
-        articoli: [],
-      });
+      agg.set(code, { ragione: ragRow, orders: new Set(), backlog: 0, articoli: [] });
     }
     const e = agg.get(code);
-    if (!e.ragione && r["CLIENTE.1"]) e.ragione = String(r["CLIENTE.1"]).trim();
-    if (r["NUM."] !== null && r["NUM."] !== undefined && r["NUM."] !== "") {
-      e.orders.add(String(r["NUM."]).trim());
+    if (!e.ragione && ragRow) e.ragione = ragRow;
+    const num = row[I.num];
+    if (num !== null && num !== undefined && num !== "") {
+      e.orders.add(String(num).trim());
     }
     e.backlog += imp;
-    const art = r["ARTICOLO"] ? String(r["ARTICOLO"]).trim() : "";
-    const desc = r["DESCRIZIONE"] ? String(r["DESCRIZIONE"]).trim() : "";
+    const art = row[I.articolo] ? String(row[I.articolo]).trim() : "";
+    const desc = row[I.descrizione] ? String(row[I.descrizione]).trim() : "";
     const label = [art, desc].filter(Boolean).join(" — ");
     if (label && !e.articoli.includes(label)) e.articoli.push(label);
   }
